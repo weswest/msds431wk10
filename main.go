@@ -1,196 +1,333 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
-	"math"
-	"math/rand"
+	"os"
+	"os/signal"
+	"runtime/pprof"
+	"syscall"
 
-	"github.com/petar/GoMNIST"
-	"gonum.org/v1/gonum/mat"
+	"net/http"
+	_ "net/http/pprof"
 
-	"github.com/LdDl/cnns"
-	"github.com/LdDl/cnns/tensor"
+	"github.com/pkg/errors"
+	"gorgonia.org/gorgonia"
+	"gorgonia.org/tensor"
+
+	"time"
+
+	"gopkg.in/cheggaaa/pb.v1"
 )
 
-// This is related to GoMNIST
-// Print the image to the console
-func printImage(image GoMNIST.RawImage) {
-	scaleFactor := 255.0 / 8.0
-	nRow := 28
-	nCol := 28
+var (
+	epochs     = flag.Int("epochs", 100, "Number of epochs to train for")
+	dataset    = flag.String("dataset", "train", "Which dataset to train on? Valid options are \"train\" or \"test\"")
+	dtype      = flag.String("dtype", "float64", "Which dtype to use")
+	batchsize  = flag.Int("batchsize", 100, "Batch size")
+	cpuprofile = flag.String("cpuprofile", "", "CPU profiling")
 
-	for i := 0; i < nRow; i++ {
-		for j := 0; j < nCol; j++ {
-			// Get the pixel value at the current position
-			pixel := image[i*nCol+j]
+	validSplit = flag.Float64("validSplit", 0.01, "% into validation")
+)
 
-			// Scale the pixel value
-			scaledPixel := int(math.Round(float64(pixel) / scaleFactor))
+const loc = "./data"
 
-			// Make sure that only 0 scales to 0
-			if pixel != 0 && scaledPixel == 0 {
-				scaledPixel = 1
-			}
+var dt tensor.Dtype
 
-			// Print a space if the pixel value is 0, otherwise print the scaled pixel value
-			if scaledPixel == 0 {
-				fmt.Print(" ")
-			} else {
-				fmt.Print(scaledPixel)
-			}
-		}
-		// Start a new line after each row
-		fmt.Println()
+func parseDtype() {
+	switch *dtype {
+	case "float64":
+		dt = tensor.Float64
+	case "float32":
+		dt = tensor.Float32
+	default:
+		log.Fatalf("Unknown dtype: %v", *dtype)
 	}
 }
 
-// This takes all of the images and converts them to float64s
-func convertMNISTForModeling(images []GoMNIST.RawImage) [][]float64 {
-	var floatImages [][]float64
-
-	for _, image := range images {
-		var floatImage []float64
-		for _, pixel := range image {
-			floatImage = append(floatImage, float64(pixel))
-		}
-		floatImages = append(floatImages, floatImage)
-	}
-
-	return floatImages
-}
-func createCNN() *cnns.WholeNet {
-	// Create a new neural network
-	net := cnns.WholeNet{
-		LP: cnns.NewLearningParametersDefault(),
-	}
-
-	// First convolutional layer: 3x3 with 32 filters
-	conv1 := cnns.NewConvLayer(&tensor.TDsize{X: 28, Y: 28, Z: 1}, 32, 3, 1)
-	net.Layers = append(net.Layers, conv1)
-
-	// ReLU activation after convolution
-	relu1 := cnns.NewReLULayer(conv1.GetOutputSize())
-	net.Layers = append(net.Layers, relu1)
-
-	// Max pooling layer: 2x2
-	maxpool1 := cnns.NewPoolingLayer(relu1.GetOutputSize(), 2, 2, "max", "valid")
-	net.Layers = append(net.Layers, maxpool1)
-
-	// Second convolutional layer: 3x3 with 64 filters
-	conv2 := cnns.NewConvLayer(maxpool1.GetOutputSize(), 64, 3, 1)
-	net.Layers = append(net.Layers, conv2)
-
-	// ReLU activation after convolution
-	relu2 := cnns.NewReLULayer(conv2.GetOutputSize())
-	net.Layers = append(net.Layers, relu2)
-
-	// Max pooling layer: 2x2
-	maxpool2 := cnns.NewPoolingLayer(relu2.GetOutputSize(), 2, 2, "max", "valid")
-	net.Layers = append(net.Layers, maxpool2)
-
-	// Fully connected (dense) layer
-	fc1 := cnns.NewFullyConnectedLayer(maxpool2.GetOutputSize(), 128)
-	fc1.SetActivationFunc(cnns.ActivationSygmoid)
-	fc1.SetActivationDerivativeFunc(cnns.ActivationSygmoidDerivative)
-	net.Layers = append(net.Layers, fc1)
-
-	// Output layer: Dense with 10 classes (digits)
-	fc2 := cnns.NewFullyConnectedLayer(fc1.GetOutputSize(), 10)
-	fc2.SetActivationFunc(cnns.ActivationSygmoid)
-	fc2.SetActivationDerivativeFunc(cnns.ActivationSygmoidDerivative)
-	net.Layers = append(net.Layers, fc2)
-
-	return &net
+type sli struct {
+	start, end int
 }
 
-func convertToTensor(images []GoMNIST.RawImage) []*tensor.Tensor {
-	tensors := make([]*tensor.Tensor, len(images))
-	for i, img := range images {
-		data := make([]float64, len(img))
-		for j, pixel := range img {
-			data[j] = float64(pixel) / 255.0 // Normalize to [0,1]
-		}
-		tensors[i] = tensor.NewTensor(data, 28, 28, 1)
-	}
-	return tensors
+func (s sli) Start() int { return s.start }
+func (s sli) End() int   { return s.end }
+func (s sli) Step() int  { return 1 }
+
+type convnet struct {
+	g                  *gorgonia.ExprGraph
+	w0, w1, w2, w3, w4 *gorgonia.Node // weights. the number at the back indicates which layer it's used for
+	d0, d1, d2, d3     float64        // dropout probabilities
+
+	out *gorgonia.Node
 }
 
-func tensorToMatrix(t *tensor.Tensor) *mat.Dense {
-	data := t.GetData()
-	return mat.NewDense(t.Dims[0], t.Dims[1]*t.Dims[2], data)
-}
+func newConvNet(g *gorgonia.ExprGraph) *convnet {
+	w0 := gorgonia.NewTensor(g, dt, 4, gorgonia.WithShape(32, 1, 3, 3), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	w1 := gorgonia.NewTensor(g, dt, 4, gorgonia.WithShape(64, 32, 3, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	w2 := gorgonia.NewTensor(g, dt, 4, gorgonia.WithShape(128, 64, 3, 3), gorgonia.WithName("w2"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	w3 := gorgonia.NewMatrix(g, dt, gorgonia.WithShape(128*3*3, 625), gorgonia.WithName("w3"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	w4 := gorgonia.NewMatrix(g, dt, gorgonia.WithShape(625, 10), gorgonia.WithName("w4"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	return &convnet{
+		g:  g,
+		w0: w0,
+		w1: w1,
+		w2: w2,
+		w3: w3,
+		w4: w4,
 
-func trainModel(cnn *cnns.WholeNet, trainImages []*tensor.Tensor, trainLabels []*mat.Dense, epochs int) {
-	for epoch := 0; epoch < epochs; epoch++ {
-		totalLoss := 0.0
-		for i, img := range trainImages {
-			// Convert tensor to matrix
-			imgMatrix := tensorToMatrix(img)
-
-			// Feedforward
-			err := cnn.FeedForward(imgMatrix)
-			if err != nil {
-				log.Printf("Feedforward caused error: %s", err.Error())
-				return
-			}
-
-			// Get the desired output for the current image
-			desiredOutput := trainLabels[i]
-
-			// Backpropagate
-			err = cnn.Backpropagate(desiredOutput)
-			if err != nil {
-				log.Printf("Backpropagate caused error: %s", err.Error())
-				return
-			}
-
-			// Accumulate loss (for demonstration purposes, using MSE here)
-			prediction := cnn.Layers[len(cnn.Layers)-1].(*cnns.FullyConnectedLayer).GetOutput() // Assuming the last layer is a FullyConnectedLayer
-			loss := 0.0
-			for j := 0; j < 10; j++ {
-				diff := prediction.At(0, j) - desiredOutput.At(0, j)
-				loss += diff * diff
-			}
-			totalLoss += loss
-		}
-		avgLoss := totalLoss / float64(len(trainImages))
-		fmt.Printf("Epoch %d: Average Loss: %f\n", epoch+1, avgLoss)
+		d0: 0.2,
+		d1: 0.2,
+		d2: 0.2,
+		d3: 0.55,
 	}
 }
 
-// ... [Rest of your code]
+func (m *convnet) learnables() gorgonia.Nodes {
+	return gorgonia.Nodes{m.w0, m.w1, m.w2, m.w3, m.w4}
+}
+
+// This function is particularly verbose for educational reasons. In reality, you'd wrap up the layers within a layer struct type and perform per-layer activations
+func (m *convnet) fwd(x *gorgonia.Node) (err error) {
+	var c0, c1, c2, fc *gorgonia.Node
+	var a0, a1, a2, a3 *gorgonia.Node
+	var p0, p1, p2 *gorgonia.Node
+	var l0, l1, l2, l3 *gorgonia.Node
+
+	// LAYER 0
+	// here we convolve with stride = (1, 1) and padding = (1, 1),
+	// which is your bog standard convolution for convnet
+	if c0, err = gorgonia.Conv2d(x, m.w0, tensor.Shape{3, 3}, []int{1, 1}, []int{1, 1}, []int{1, 1}); err != nil {
+		return errors.Wrap(err, "Layer 0 Convolution failed")
+	}
+	if a0, err = gorgonia.Rectify(c0); err != nil {
+		return errors.Wrap(err, "Layer 0 activation failed")
+	}
+	if p0, err = gorgonia.MaxPool2D(a0, tensor.Shape{2, 2}, []int{0, 0}, []int{2, 2}); err != nil {
+		return errors.Wrap(err, "Layer 0 Maxpooling failed")
+	}
+	log.Printf("p0 shape %v", p0.Shape())
+	if l0, err = gorgonia.Dropout(p0, m.d0); err != nil {
+		return errors.Wrap(err, "Unable to apply a dropout")
+	}
+
+	// Layer 1
+	if c1, err = gorgonia.Conv2d(l0, m.w1, tensor.Shape{3, 3}, []int{1, 1}, []int{1, 1}, []int{1, 1}); err != nil {
+		return errors.Wrap(err, "Layer 1 Convolution failed")
+	}
+	if a1, err = gorgonia.Rectify(c1); err != nil {
+		return errors.Wrap(err, "Layer 1 activation failed")
+	}
+	if p1, err = gorgonia.MaxPool2D(a1, tensor.Shape{2, 2}, []int{0, 0}, []int{2, 2}); err != nil {
+		return errors.Wrap(err, "Layer 1 Maxpooling failed")
+	}
+	if l1, err = gorgonia.Dropout(p1, m.d1); err != nil {
+		return errors.Wrap(err, "Unable to apply a dropout to layer 1")
+	}
+
+	// Layer 2
+	if c2, err = gorgonia.Conv2d(l1, m.w2, tensor.Shape{3, 3}, []int{1, 1}, []int{1, 1}, []int{1, 1}); err != nil {
+		return errors.Wrap(err, "Layer 2 Convolution failed")
+	}
+	if a2, err = gorgonia.Rectify(c2); err != nil {
+		return errors.Wrap(err, "Layer 2 activation failed")
+	}
+	if p2, err = gorgonia.MaxPool2D(a2, tensor.Shape{2, 2}, []int{0, 0}, []int{2, 2}); err != nil {
+		return errors.Wrap(err, "Layer 2 Maxpooling failed")
+	}
+	log.Printf("p2 shape %v", p2.Shape())
+
+	var r2 *gorgonia.Node
+	b, c, h, w := p2.Shape()[0], p2.Shape()[1], p2.Shape()[2], p2.Shape()[3]
+	if r2, err = gorgonia.Reshape(p2, tensor.Shape{b, c * h * w}); err != nil {
+		return errors.Wrap(err, "Unable to reshape layer 2")
+	}
+	log.Printf("r2 shape %v", r2.Shape())
+	if l2, err = gorgonia.Dropout(r2, m.d2); err != nil {
+		return errors.Wrap(err, "Unable to apply a dropout on layer 2")
+	}
+
+	os.WriteFile("tmp.dot", []byte(m.g.ToDot()), 0644)
+
+	// Layer 3
+	if fc, err = gorgonia.Mul(l2, m.w3); err != nil {
+		return errors.Wrapf(err, "Unable to multiply l2 and w3")
+	}
+	if a3, err = gorgonia.Rectify(fc); err != nil {
+		return errors.Wrapf(err, "Unable to activate fc")
+	}
+	if l3, err = gorgonia.Dropout(a3, m.d3); err != nil {
+		return errors.Wrapf(err, "Unable to apply a dropout on layer 3")
+	}
+
+	// output decode
+	var out *gorgonia.Node
+	if out, err = gorgonia.Mul(l3, m.w4); err != nil {
+		return errors.Wrapf(err, "Unable to multiply l3 and w4")
+	}
+	m.out, err = gorgonia.SoftMax(out)
+	return
+}
 
 func main() {
-	rng := rand.New(rand.NewSource(431)) //Obvi.
-	fmt.Println("Random number: ", rng.Intn(100))
+	flag.Parse()
+	parseDtype()
 
-	//////////////////////////
-	// GoMNIST time			//
-	//////////////////////////
-	// Load the dataset
-	train, test, err := GoMNIST.Load("./data")
-	if err != nil {
-		fmt.Println(err)
+	cwd, _ := os.Getwd()
+	fmt.Println("Current working directory:", cwd)
+
+	// intercept Ctrl+C
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	doneChan := make(chan bool, 1)
+
+	var inputs, targets tensor.Tensor
+	var err error
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	//	if inputs, targets, err = Load(loc, dt); err != nil {
+	//	if trainInputs, trainTargets, validInputs, validTargets, testInputs, testTargets, err = Load(loc, dt); err != nil {
+
+	trainOn := *dataset
+	if inputs, targets, err = loadOriginal(trainOn, loc, dt); err != nil {
+		log.Fatal(err)
 	}
-	fmt.Println("First Train label: ", train.Labels[0])
-	printImage(train.Images[0])
+	// the data is in (numExamples, 784).
+	// In order to use a convnet, we need to massage the data
+	// into this format (batchsize, numberOfChannels, height, width).
+	//
+	// This translates into (numExamples, 1, 28, 28).
+	//
+	// This is because the convolution operators actually understand height and width.
+	//
+	// The 1 indicates that there is only one channel (MNIST data is black and white).
+	numExamples := inputs.Shape()[0]
+	bs := *batchsize
+	// todo - check bs not 0
 
-	// This code returns the train and test MNIST.Set types
-	// Set has NRow, NCol, Images ([]RawImage), Labels ([]Label)
+	if err := inputs.Reshape(numExamples, 1, 28, 28); err != nil {
+		log.Fatal(err)
+	}
+	g := gorgonia.NewGraph()
+	x := gorgonia.NewTensor(g, dt, 4, gorgonia.WithShape(bs, 1, 28, 28), gorgonia.WithName("x"))
+	y := gorgonia.NewMatrix(g, dt, gorgonia.WithShape(bs, 10), gorgonia.WithName("y"))
+	m := newConvNet(g)
+	if err = m.fwd(x); err != nil {
+		log.Fatalf("%+v", err)
+	}
+	losses := gorgonia.Must(gorgonia.HadamardProd(m.out, y))
+	cost := gorgonia.Must(gorgonia.Mean(losses))
+	cost = gorgonia.Must(gorgonia.Neg(cost))
 
-	fmt.Println("MNIST Rows: ", train.NRow, test.NRow)
-	fmt.Println("MNIST Columns: ", train.NCol, test.NCol)
-	inputData := convertMNISTForModeling(train.Images)
-	fmt.Println(inputData)
+	// we wanna track costs
+	var costVal gorgonia.Value
+	gorgonia.Read(cost, &costVal)
 
-	// Convert MNIST data to suitable format
-	trainTensors := convertToTensor(train.Images)
-	trainMatrix := convertToMatrix(train.Labels)
+	// if _, err = gorgonia.Grad(cost, m.learnables()...); err != nil {
+	// 	log.Fatal(err)
+	// }
 
-	// Create the CNN model
-	cnn := createCNN()
+	// debug
+	// ioutil.WriteFile("fullGraph.dot", []byte(g.ToDot()), 0644)
+	// log.Printf("%v", prog)
+	// logger := log.New(os.Stderr, "", 0)
+	// vm := gorgonia.NewTapeMachine(g, gorgonia.BindDualValues(m.learnables()...), gorgonia.WithLogger(logger), gorgonia.WithWatchlist())
 
-	// Train the model
-	trainModel(cnn, trainTensors, trainMatrix, 10) // Training for 10 epochs as an example
+	prog, locMap, _ := gorgonia.Compile(g)
+	log.Printf("%v", prog)
+
+	vm := gorgonia.NewTapeMachine(g, gorgonia.WithPrecompiled(prog, locMap), gorgonia.BindDualValues(m.learnables()...))
+	solver := gorgonia.NewRMSPropSolver(gorgonia.WithBatchSize(float64(bs)))
+	defer vm.Close()
+	// pprof
+	// handlePprof(sigChan, doneChan)
+
+	var profiling bool
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		profiling = true
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+	go cleanup(sigChan, doneChan, profiling)
+
+	batches := numExamples / bs
+	log.Printf("Batches %d", batches)
+	bar := pb.New(batches)
+	bar.SetRefreshRate(time.Second)
+	bar.SetMaxWidth(80)
+
+	for i := 0; i < *epochs; i++ {
+		bar.Prefix(fmt.Sprintf("Epoch %d", i))
+		bar.Set(0)
+		bar.Start()
+		for b := 0; b < batches; b++ {
+			start := b * bs
+			end := start + bs
+			if start >= numExamples {
+				break
+			}
+			if end > numExamples {
+				end = numExamples
+			}
+
+			var xVal, yVal tensor.Tensor
+			if xVal, err = inputs.Slice(sli{start, end}); err != nil {
+				log.Fatal("Unable to slice x")
+			}
+
+			if yVal, err = targets.Slice(sli{start, end}); err != nil {
+				log.Fatal("Unable to slice y")
+			}
+			if err = xVal.(*tensor.Dense).Reshape(bs, 1, 28, 28); err != nil {
+				log.Fatalf("Unable to reshape %v", err)
+			}
+
+			gorgonia.Let(x, xVal)
+			gorgonia.Let(y, yVal)
+			if err = vm.RunAll(); err != nil {
+				log.Fatalf("Failed at epoch  %d: %v", i, err)
+			}
+			solver.Step(gorgonia.NodesToValueGrads(m.learnables()))
+			vm.Reset()
+			bar.Increment()
+		}
+		log.Printf("Epoch %d | cost %v", i, costVal)
+
+	}
+}
+
+func cleanup(sigChan chan os.Signal, doneChan chan bool, profiling bool) {
+	select {
+	case <-sigChan:
+		log.Println("EMERGENCY EXIT!")
+		if profiling {
+			log.Println("Stop profiling")
+			pprof.StopCPUProfile()
+		}
+		os.Exit(1)
+
+	case <-doneChan:
+		return
+	}
+}
+
+func handlePprof(sigChan chan os.Signal, doneChan chan bool) {
+	var profiling bool
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		profiling = true
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+	go cleanup(sigChan, doneChan, profiling)
 }
